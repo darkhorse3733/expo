@@ -4,7 +4,7 @@ import ExpoModulesCore
 struct RecordingUtils {
   static func getAvailableInputs() -> [[String: Any]] {
     AVAudioSession.sharedInstance().availableInputs?.map { desc in
-      ["name": desc.portName, "type": desc.portType, "uid": desc.uid]
+      ["name": desc.portName, "type": desc.portType.rawValue, "uid": desc.uid]
     } ?? []
   }
 
@@ -185,6 +185,14 @@ struct AudioUtils {
       return UInt32(s[3]) | (UInt32(s[2]) << 8) | (UInt32(s[1]) << 16) | (UInt32(s[0]) << 24)
     }
     return nil
+  }
+
+  static func recordingDirectory(for directory: RecordingDirectory?, appContext: AppContext?) throws -> URL {
+    guard let fileSystem = appContext?.fileSystem else {
+      throw Exceptions.AppContextLost()
+    }
+    let path = (directory ?? .cache) == .document ? fileSystem.documentDirectory : fileSystem.cachesDirectory
+    return URL(fileURLWithPath: path)
   }
 
   static func validateAudioMode(mode: AudioMode) throws {

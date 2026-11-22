@@ -1,13 +1,13 @@
 import ExpoModulesCore
-import os
 
-public class AudioModule: Module {
+@ExpoModule("ExpoAudio")
+public final class AudioModule: Module {
   private let registry = AudioComponentRegistry()
 
   private let sessionQueue = DispatchQueue(label: "expo.modules.audio.session", qos: .userInitiated)
   private var sessionIsActive = false
   private var audioSessionActivityKeepers = Set<String>()
-  private let audioEnabled = OSAllocatedUnfairLock(initialState: true)
+  private let audioEnabled = Mutex(true)
 
   // MARK: Properties
   private var recordingSettings = [String: Any]()
@@ -18,116 +18,125 @@ public class AudioModule: Module {
   private var allowsRecording = false
   private var allowsBackgroundRecording = false
   private var sessionOptions: AVAudioSession.CategoryOptions = []
-  private var lastConfiguredMode: AudioMode?
+  private(set) var lastConfiguredMode: AudioMode?
+
+  public override func didCreate() {
+    #if os(iOS)
+    appContext?.permissions?.register([
+      AudioRecordingRequester()
+    ])
+    #endif
+
+    setupInterruptionHandling()
+  }
+
+  public override func willDestroy() {
+    registry.removeAllPreloadedPlayers()
+    registry.removeAll()
+    NotificationCenter.default.removeObserver(self)
+    sessionQueue.async {
+      self.audioSessionActivityKeepers.removeAll()
+      if self.sessionIsActive {
+        self.applySessionActive(false)
+      }
+    }
+  }
+
+  @MainActor
+  public override func appDidEnterBackground() {
+    if !shouldPlayInBackground {
+      pauseAllPlayers()
+    }
+    #if os(iOS)
+    if !allowsBackgroundRecording {
+      pauseAllRecorders()
+    }
+    #endif
+  }
+
+  @MainActor
+  public override func appWillEnterForeground() {
+    if !shouldPlayInBackground {
+      resumeAllPlayers()
+    }
+    #if os(iOS)
+    if !allowsBackgroundRecording {
+      resumeAllRecorders()
+    }
+    #endif
+  }
+
+  @JS(.concurrent)
+  func setAudioModeAsync(_ mode: PartialAudioMode) async throws {
+    try setAudioMode(mode: mode.merged(into: lastConfiguredMode ?? AudioMode()))
+  }
+
+  @JS(.concurrent)
+  func setIsAudioActiveAsync(_ isActive: Bool) async throws {
+    try await setIsAudioActive(isActive)
+  }
+
+  @JS
+  func requestRecordingPermissionsAsync() async throws -> [String: Any] {
+    #if os(iOS)
+    guard let permissions = appContext?.permissions else {
+      throw Exceptions.PermissionsModuleNotFound()
+    }
+    return try await withPermissionsContinuation { resolve, reject in
+      permissions.askForPermission(usingRequesterClass: AudioRecordingRequester.self, resolve: resolve, reject: reject)
+    }
+    #else
+    throw Exception(name: "UnsupportedOperation", description: "Audio recording is not supported on this platform.")
+    #endif
+  }
+
+  @JS
+  func getRecordingPermissionsAsync() async throws -> [String: Any] {
+    #if os(iOS)
+    guard let permissions = appContext?.permissions else {
+      throw Exceptions.PermissionsModuleNotFound()
+    }
+    return try await withPermissionsContinuation { resolve, reject in
+      permissions.getPermissionUsingRequesterClass(AudioRecordingRequester.self, resolve: resolve, reject: reject)
+    }
+    #else
+    throw Exception(name: "UnsupportedOperation", description: "Audio recording is not supported on this platform.")
+    #endif
+  }
+
+  @JS(.concurrent)
+  func preload(_ source: AudioSource, _ preferredForwardBufferDuration: Double) async {
+    guard let uri = source.uri else {
+      return
+    }
+    let key = uri.absoluteString
+    if registry.hasPreloadedPlayer(forKey: key) {
+      return
+    }
+    let player = AudioUtils.createAVPlayer(from: source)
+    player.currentItem?.preferredForwardBufferDuration = preferredForwardBufferDuration
+    registry.addPreloadedPlayer(player, forKey: key)
+  }
+
+  @JS(.concurrent)
+  func clearPreloadedSource(_ source: AudioSource) async {
+    guard let uri = source.uri else {
+      return
+    }
+    _ = registry.removePreloadedPlayer(forKey: uri.absoluteString)
+  }
+
+  @JS(.concurrent)
+  func clearAllPreloadedSources() async {
+    registry.removeAllPreloadedPlayers()
+  }
+
+  @JS(.concurrent)
+  func getPreloadedSources() async -> [String] {
+    registry.preloadedPlayerKeys()
+  }
 
   public func definition() -> ModuleDefinition {
-    Name("ExpoAudio")
-
-    OnCreate {
-      #if os(iOS)
-      self.appContext?.permissions?.register([
-        AudioRecordingRequester()
-      ])
-      #endif
-
-      setupInterruptionHandling()
-    }
-
-    AsyncFunction("setAudioModeAsync") { (mode: PartialAudioMode) in
-      try setAudioMode(mode: mode.merged(into: lastConfiguredMode ?? AudioMode()))
-    }
-
-    AsyncFunction("setIsAudioActiveAsync") { (isActive: Bool, promise: Promise) in
-      setIsAudioActive(isActive, promise: promise)
-    }
-
-    AsyncFunction("requestRecordingPermissionsAsync") { (promise: Promise) in
-      #if os(iOS)
-      appContext?.permissions?.askForPermission(
-        usingRequesterClass: AudioRecordingRequester.self,
-        resolve: promise.legacyResolver,
-        reject: promise.legacyRejecter
-      )
-      #else
-      promise.reject(Exception.init(name: "UnsupportedOperation", description: "Audio recording is not supported on this platform."))
-      #endif
-    }
-
-    AsyncFunction("getRecordingPermissionsAsync") { (promise: Promise) in
-      #if os(iOS)
-      appContext?.permissions?.getPermissionUsingRequesterClass(
-        AudioRecordingRequester.self,
-        resolve: promise.legacyResolver,
-        reject: promise.legacyRejecter
-      )
-      #else
-      promise.reject(Exception.init(name: "UnsupportedOperation", description: "Audio recording is not supported on this platform."))
-      #endif
-    }
-
-    AsyncFunction("preload") { (source: AudioSource, preferredForwardBufferDuration: Double) in
-      guard let uri = source.uri else {
-        return
-      }
-      let key = uri.absoluteString
-      if self.registry.hasPreloadedPlayer(forKey: key) {
-        return
-      }
-      let player = AudioUtils.createAVPlayer(from: source)
-      player.currentItem?.preferredForwardBufferDuration = preferredForwardBufferDuration
-      self.registry.addPreloadedPlayer(player, forKey: key)
-    }
-
-    AsyncFunction("clearPreloadedSource") { (source: AudioSource) in
-      guard let uri = source.uri else {
-        return
-      }
-      let key = uri.absoluteString
-      _ = self.registry.removePreloadedPlayer(forKey: key)
-    }
-
-    AsyncFunction("clearAllPreloadedSources") {
-      self.registry.removeAllPreloadedPlayers()
-    }
-
-    AsyncFunction("getPreloadedSources") {
-      self.registry.preloadedPlayerKeys()
-    }
-
-    OnDestroy {
-      registry.removeAllPreloadedPlayers()
-      registry.removeAll()
-      NotificationCenter.default.removeObserver(self)
-      sessionQueue.async {
-        self.audioSessionActivityKeepers.removeAll()
-        if self.sessionIsActive {
-          self.applySessionActive(false)
-        }
-      }
-    }
-
-    OnAppEntersBackground {
-      if !shouldPlayInBackground {
-        pauseAllPlayers()
-      }
-      #if os(iOS)
-      if !allowsBackgroundRecording {
-        pauseAllRecorders()
-      }
-      #endif
-    }
-
-    OnAppEntersForeground {
-      if !shouldPlayInBackground {
-        resumeAllPlayers()
-      }
-      #if os(iOS)
-      if !allowsBackgroundRecording {
-        resumeAllRecorders()
-      }
-      #endif
-    }
-
     // swiftlint:disable:next closure_body_length
     Class(AudioPlayer.self) {
       Constructor { (source: AudioSource?, updateInterval: Double, keepAudioSessionActive: Bool, preferredForwardBufferDuration: Double, allowsExternalPlayback: Bool) -> AudioPlayer in
@@ -456,10 +465,9 @@ public class AudioModule: Module {
     }
 
     #if os(iOS)
-    // swiftlint:disable:next closure_body_length
     Class(AudioRecorder.self) {
       Constructor { (options: RecordingOptions) -> AudioRecorder in
-        let recordingDir = try recordingDirectory(for: options.directory)
+        let recordingDir = try AudioUtils.recordingDirectory(for: options.directory, appContext: self.appContext)
         let avRecorder = try AudioUtils.createRecorder(directory: recordingDir, with: options)
         let recorder = AudioRecorder(avRecorder, options: options)
         recorder.owningRegistry = self.registry
@@ -467,22 +475,6 @@ public class AudioModule: Module {
         self.registry.add(recorder)
 
         return recorder
-      }
-
-      Property("id") { recorder in
-        recorder.id
-      }
-
-      Property("isRecording") { recorder in
-        recorder.isRecording
-      }
-
-      Property("currentTime") { recorder in
-        recorder.ref.currentTime
-      }
-
-      Property("uri") { recorder in
-        recorder.uri
       }
 
       AsyncFunction("prepareToRecordAsync") { (recorder, options: RecordingOptions?) in
@@ -497,64 +489,6 @@ public class AudioModule: Module {
         )
         recordSessionActive(true)
       }
-
-      Function("record") { (recorder: AudioRecorder, options: RecordOptions?) in
-        try checkPermissions()
-
-        switch (options?.atTime, options?.forDuration) {
-        case let (atTime?, forDuration?):
-          // Convert relative delay to absolute device time
-          let absoluteTime = recorder.ref.deviceCurrentTime + TimeInterval(atTime)
-          try recorder.recordForDuration(TimeInterval(forDuration), atTime: absoluteTime)
-          return recorder.getRecordingStatus()
-        case let (atTime?, nil):
-          // Convert relative delay to absolute device time
-          let absoluteTime = recorder.ref.deviceCurrentTime + TimeInterval(atTime)
-          try recorder.record(atTime: absoluteTime)
-          return recorder.getRecordingStatus()
-        case let (nil, forDuration?):
-          try recorder.recordForDuration(TimeInterval(forDuration))
-          return recorder.getRecordingStatus()
-        case (nil, nil):
-          return try recorder.startRecording()
-        }
-      }
-
-      Function("pause") { recorder in
-        try checkPermissions()
-        recorder.pauseRecording()
-      }
-
-      AsyncFunction("stop") { recorder in
-        try checkPermissions()
-        recorder.stopRecording()
-      }
-
-      Function("getStatus") { recorder -> [String: Any] in
-        recorder.getRecordingStatus()
-      }
-
-      Function("startRecordingAtTime") { (recorder, seconds: Double) in
-        try checkPermissions()
-        try recorder.record(atTime: TimeInterval(seconds))
-      }
-
-      Function("recordForDuration") { (recorder, seconds: Double) in
-        try checkPermissions()
-        try recorder.recordForDuration(TimeInterval(seconds))
-      }
-
-      Function("getAvailableInputs") {
-        RecordingUtils.getAvailableInputs()
-      }
-
-      Function("getCurrentInput") { () -> [String: Any] in
-        try RecordingUtils.getCurrentInput()
-      }
-
-      Function("setInput") { (input: String) in
-        try RecordingUtils.setInput(input)
-      }
     }
 
     Class(AudioStream.self) {
@@ -562,24 +496,8 @@ public class AudioModule: Module {
         return AudioStream(options: options)
       }
 
-      Property("id") { (stream: AudioStream) in
-        stream.id
-      }
-
-      Property("sampleRate") { (stream: AudioStream) in
-        stream.sampleRate
-      }
-
-      Property("channels") { (stream: AudioStream) in
-        stream.channels
-      }
-
-      Property("isStreaming") { (stream: AudioStream) in
-        stream.isStreaming
-      }
-
       AsyncFunction("start") { (stream: AudioStream) in
-        try checkPermissions()
+        try AudioRecordingRequester.requirePermission()
         let deactivateSessionOnFailure = sessionQueue.sync {
           !sessionIsActive && audioSessionActivityKeepers.isEmpty
         }
@@ -590,31 +508,6 @@ public class AudioModule: Module {
       Function("stop") { (stream: AudioStream) in
         stream.stop()
         self.deactivateSession()
-      }
-
-      AsyncFunction("startFileRecordingAsync") { (stream: AudioStream, options: AudioStreamFileRecordingOptions?) throws -> AudioStreamFileRecordingStartResult in
-        let opts = options ?? AudioStreamFileRecordingOptions()
-        let format = opts.format
-        let url: URL
-        if let uri = opts.uri {
-          guard uri.pathExtension.lowercased() == format.fileExtension else {
-            throw AudioStreamFileException(
-              "The URI '\(uri.lastPathComponent)' has extension '.\(uri.pathExtension.lowercased())' but the chosen format is '\(format.rawValue)'. Change the URI extension or the format to match."
-            )
-          }
-          url = uri
-        } else {
-          let baseDir = try recordingDirectory(for: opts.directory)
-          let streamDir = baseDir.appendingPathComponent("AudioStream")
-          try FileManager.default.createDirectory(at: streamDir, withIntermediateDirectories: true)
-          url = streamDir.appendingPathComponent("stream-\(UUID().uuidString).\(format.fileExtension)")
-        }
-        let resolvedUri = try stream.startFileRecording(url: url, format: format)
-        return AudioStreamFileRecordingStartResult(uri: resolvedUri)
-      }
-
-      AsyncFunction("stopFileRecordingAsync") { (stream: AudioStream) throws -> AudioStreamFileRecordingResult in
-        return try stream.stopFileRecording()
       }
     }
     #endif
@@ -828,30 +721,24 @@ public class AudioModule: Module {
 #endif
   }
 
-  private func recordingDirectory(for directory: RecordingDirectory?) throws -> URL {
-    guard let fileSystem = appContext?.fileSystem else {
-      throw Exceptions.AppContextLost()
-    }
-    let path = (directory ?? .cache) == .document ? fileSystem.documentDirectory : fileSystem.cachesDirectory
-    return URL(fileURLWithPath: path)
-  }
-
-  private func setIsAudioActive(_ isActive: Bool, promise: Promise) {
+  private func setIsAudioActive(_ isActive: Bool) async throws {
     audioEnabled.withLock { $0 = isActive }
     if !isActive {
       pauseAllPlayers()
     }
 
-    sessionQueue.async {
-      do {
-        try AVAudioSession.sharedInstance().setActive(isActive, options: self.activationOptions(isActive: isActive))
-        self.sessionIsActive = isActive
-        if !isActive {
-          self.audioSessionActivityKeepers.removeAll()
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      sessionQueue.async {
+        do {
+          try AVAudioSession.sharedInstance().setActive(isActive, options: self.activationOptions(isActive: isActive))
+          self.sessionIsActive = isActive
+          if !isActive {
+            self.audioSessionActivityKeepers.removeAll()
+          }
+          continuation.resume()
+        } catch {
+          continuation.resume(throwing: AudioStateException(error.localizedDescription))
         }
-        promise.resolve()
-      } catch {
-        promise.reject(AudioStateException(error.localizedDescription))
       }
     }
   }
@@ -1026,25 +913,17 @@ public class AudioModule: Module {
     }
   }
 
-  private func checkPermissions() throws {
-    #if os(iOS)
-    try AudioRecordingRequester.requireUsageDescription()
-
-    if #available(iOS 17.0, *) {
-      switch AVAudioApplication.shared.recordPermission {
-      case .denied, .undetermined:
-        throw AudioPermissionsException()
-      default:
-        break
+  private func withPermissionsContinuation(
+    _ body: (@escaping EXPromiseResolveBlock, @escaping EXPromiseRejectBlock) -> Void
+  ) async throws -> [String: Any] {
+    return try await withCheckedThrowingContinuation { continuation in
+      let resolve: EXPromiseResolveBlock = { result in
+        continuation.resume(returning: result as? [String: Any] ?? [:])
       }
-    } else {
-      switch AVAudioSession.sharedInstance().recordPermission {
-      case .denied, .undetermined:
-        throw AudioPermissionsException()
-      default:
-        break
+      let reject: EXPromiseRejectBlock = { code, message, _ in
+        continuation.resume(throwing: Exception(name: code ?? "", description: message ?? "", code: code ?? ""))
       }
+      body(resolve, reject)
     }
-    #endif
   }
 }
